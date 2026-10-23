@@ -1,0 +1,8 @@
+{
+  "Id": "deceiverfusionslots20",
+  "DisplayName": "Deceiver Fusion Slots 20",
+  "Author": "Custom",
+  "Version": "1.0.0",
+  "AssemblyName": "DeceiverFusionSlots20.dll",
+  "EntryMethod": "DeceiverFusionSlots20.Main.Load"
+}
