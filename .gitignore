@@ -1,0 +1,10 @@
+# 运行/调试产物
+*.log
+*.cache
+*.pdb
+
+# 本地工具链（Roslyn 编译器约 25MB，不入库）
+.tools/
+
+# 本地工作笔记
+.workbuddy/

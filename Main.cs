@@ -47,19 +47,13 @@ namespace DeceiverFusionSlots20
             try
             {
                 UIHost.Create();
+                // 蓝图构建必须远离 UI 构建路径：放在常驻协程里后台完成。
+                // 在 GetDefaultBlueprint 里现做会拖慢/打断读档时的法术书绑定。
+                if (UIHost.Instance != null) UIHost.Instance.BeginWarmup();
             }
             catch (Exception e)
             {
                 Log("UIHost create failed: " + e.Message);
-            }
-
-            try
-            {
-                ExtraBlueprints.Ensure();
-            }
-            catch (Exception e)
-            {
-                Log("Early blueprint setup failed (lazy retry enabled): " + e);
             }
         }
 
@@ -123,6 +117,13 @@ namespace DeceiverFusionSlots20
 
         private static bool s_Built;
         private static bool s_Building;
+        private static float s_LastRegisterCheck;
+
+        /// <summary>蓝图是否已经构建完成（由后台协程轮询驱动）。</summary>
+        internal static bool IsBuilt
+        {
+            get { return s_Built && s_Sets.Count > 0; }
+        }
 
         /// <summary>构建（幂等）。构造 10 组新蓝图 = 原版 0~9 号的克隆，供 11~20 号槽位使用。</summary>
         public static void Ensure()
@@ -161,7 +162,7 @@ namespace DeceiverFusionSlots20
 
             if (spellbook == null)
             {
-                Main.Log("MagicDeceiverSpellbook not loaded yet, will retry lazily.");
+                // 蓝图还没加载完，后台协程会自动重试，这里静默返回（否则会刷屏）
                 return;
             }
 
@@ -222,8 +223,10 @@ namespace DeceiverFusionSlots20
                 if (comp == null) return false;
                 if (index < Main.BaseSlots || index >= Main.TargetSlots) return false;
 
-                Ensure();
-                EnsureRegistered();
+                // 关键：这里绝不触发构建。该方法是游戏的运行时查询路径（读档、UI 绑定、
+                // 施法计算都会调），一旦在里面做蓝图克隆，就会打断读档时法术书的初始化
+                // —— 表现为"第一次读档法术书消失，第二次又正常"。
+                if (!IsBuilt) return false;
 
                 ExtraSet set;
                 if (!s_Sets.TryGetValue(comp, out set)) return false;
@@ -233,6 +236,7 @@ namespace DeceiverFusionSlots20
                 if (i < 0 || i >= list.Count) return false;
                 if (list[i] == null) return false;
 
+                MaybeReRegister();
                 result = list[i];
                 return true;
             }
@@ -241,6 +245,19 @@ namespace DeceiverFusionSlots20
                 Main.Log("TryGetExtra error: " + e.Message);
                 return false;
             }
+        }
+
+        /// <summary>
+        /// 保险：若蓝图缓存被清空（回主菜单、切场景等），把自建蓝图重新塞回去。
+        /// 最多每 5 秒检查一次，避免在每帧路径上重复遍历。
+        /// </summary>
+        private static void MaybeReRegister()
+        {
+            if (!IsBuilt) return;
+            float now = Time.realtimeSinceStartup;
+            if (now - s_LastRegisterCheck < 5f) return;
+            s_LastRegisterCheck = now;
+            EnsureRegistered();
         }
 
         /// <summary>保险：若蓝图缓存被清空（回主菜单等），把自建蓝图重新塞回去，避免读档时找不到。</summary>
@@ -397,8 +414,6 @@ namespace DeceiverFusionSlots20
         {
             try
             {
-                ExtraBlueprints.Ensure();
-
                 if (s_SelectedField == null)
                 {
                     Main.Log("SelectedSlotIndex backing field not found, fallback to vanilla");
@@ -408,7 +423,17 @@ namespace DeceiverFusionSlots20
                 int current = (int)s_SelectedField.GetValue(__instance);
                 if (current == slotIndex) return false;
 
-                int clamped = Mathf.Clamp(slotIndex, 0, Main.TargetSlots - 1);
+                int max = Main.TargetSlots - 1;
+
+                // 保险：读档时游戏可能恢复上次选中的 11~20 槽，而此刻蓝图还没建好。
+                // 这时把索引落回原版合法范围，避免 UI 拿到 null 蓝图后绑定失败
+                // （这是"第一次读档法术书消失"的第二条可能路径）。
+                if (slotIndex >= Main.BaseSlots && !ExtraBlueprints.IsBuilt)
+                {
+                    max = Main.BaseSlots - 1;
+                }
+
+                int clamped = Mathf.Clamp(slotIndex, 0, max);
                 s_SelectedField.SetValue(__instance, clamped);
 
                 if (clamped != current)
@@ -429,6 +454,43 @@ namespace DeceiverFusionSlots20
     // =========================================================================================
     internal static class SlotsUI
     {
+        /// <summary>整块栅格相对"游戏原生位置"的整体平移（正 y = 向上）。一格 ≈ 53 × 58。</summary>
+        public const float ShiftX = 0f;    // 0 = 左移一格（原为 +53）
+        public const float ShiftY = 29f;   // 下移半格（原为 +58）
+
+        // Ensure 时记录的第一排原生基准（不含平移）。同步协程靠它把两排压在目标位置上。
+        private static float[] s_RowX;
+        private static float s_RowY;
+        private static bool s_HasRow;
+
+        /// <summary>第二排是否已经建出来（协程重试用）。</summary>
+        public static bool IsExtended(SpellbookMagicHackMixerView view)
+        {
+            try
+            {
+                if (view == null) return false;
+                FieldInfo f = Main.FindField(typeof(SpellbookMagicHackMixerView), "m_Slots");
+                if (f == null) return false;
+                var group = f.GetValue(view) as OwlcatToggleGroup;
+                if (group == null) return false;
+
+                // 与 Ensure 相同的父节点判定逻辑
+                Transform parent = group.transform;
+                if (parent.Find("Slot_1") == null)
+                {
+                    OwlcatToggle t = FindToggleByName(group, "Slot_1");
+                    if (t != null) parent = t.transform.parent;
+                }
+                if (parent == null) return false;
+
+                return parent.Find("Slot_" + (Main.BaseSlots + 1)) != null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public static void Ensure(SpellbookMagicHackMixerView view)
         {
             if (view == null) return;
@@ -465,35 +527,53 @@ namespace DeceiverFusionSlots20
             var rt1 = slot1.transform as RectTransform;
             if (rt1 == null) { Main.Log("Slot_1 has no RectTransform"); return; }
 
-            // ---------------------------------------------------------------
-            // 用公式推算栅格，不读每个按钮的实际坐标。
-            // （踩过的坑：读 Slot_1..10 的 localPosition 再贴过去，布局还没跑完时
-            //   10 个按钮坐标完全一样，整块会塌成一个点。这里只拿 Slot_1 当原点。）
-            // ---------------------------------------------------------------
+            // 整块栅格相对"游戏原生位置"的整体平移（正 y = 向上）
+            const float shiftX = ShiftX;
+            const float shiftY = ShiftY;
+
+            // ---- 第一步：先让原生布局跑完，再读第一排的真实列坐标 ----
+            // 这样列位置/列距完全跟随游戏（分辨率、UI 缩放变化都不会再错位）。
+            var rowX = new float[Main.BaseSlots];
+            bool haveRow = false;
+
+            try
+            {
+                Canvas.ForceUpdateCanvases();
+                var parentRt = parent as RectTransform;
+                if (parentRt != null) LayoutRebuilder.ForceRebuildLayoutImmediate(parentRt);
+                haveRow = TryReadRowX(parent, rowX);
+            }
+            catch (Exception e)
+            {
+                Main.Log("Read native row failed: " + e.Message);
+            }
+
+            // 必须在强制布局之后再读 Slot_1 的位置（布局会改写它）
             Vector3 pos1 = rt1.localPosition;
 
-            const float dx = 53f;        // 横向步进（一格宽）
-            const float rowStep = 58f;   // 纵向步进（一格高）
+            // 兜底：布局还没生效（10 个坐标全等）时用固定步进推算
+            const float fallbackDx = 53f;
+            if (!haveRow)
+            {
+                for (int i = 0; i < Main.BaseSlots; i++) rowX[i] = pos1.x + i * fallbackDx;
+            }
 
-            // 整块栅格相对 Slot_1 原位的偏移（正 y = 向上）
-            const float offsetX = 53f;   // 右移一格
-            const float offsetY = 58f;   // 上移一格（= 在上一版基础上再上移半格）
+            float baseY = pos1.y + shiftY;
+            float rowStep = (rt1.rect.height > 10f) ? rt1.rect.height + 10f : 58f;
 
-            float baseX = pos1.x + offsetX;
-            float baseY = pos1.y + offsetY;
-
-            // 关掉并移除自动布局，否则克隆体也会被排进第一排
+            // ---- 第二步：停掉自动布局 ----
+            // 必须先 enabled=false 立即生效，再 Destroy；否则它会在帧末把刚设的坐标拉回去。
             DisableLayout<HorizontalLayoutGroup>(parent.gameObject);
             DisableLayout<VerticalLayoutGroup>(parent.gameObject);
             DisableLayout<GridLayoutGroup>(parent.gameObject);
 
-            // 第一排（原版 10 格）按同一套栅格重排，保证两排严格对齐
+            // 第一排：逐格套用原生 x + 整体平移，不重算间距（避免累积误差）
             for (int n = 1; n <= Main.BaseSlots; n++)
             {
                 Transform t = parent.Find("Slot_" + n);
                 var rt = t as RectTransform;
                 if (rt == null) continue;
-                rt.localPosition = new Vector3(baseX + (n - 1) * dx, baseY, 0f);
+                rt.localPosition = new Vector3(rowX[n - 1] + shiftX, baseY, 0f);
             }
 
             Type toggleType = slot1.GetType();
@@ -523,12 +603,13 @@ namespace DeceiverFusionSlots20
                     // 克隆体沿用了 Slot_1 的编号文本，改成 11..20
                     RelabelSlot(go, n);
 
-                    // 定位到第一排对应格子的正下方
+                    // 落在第一排对应格子的正下方（x 直接复制第一排那一列）
                     var nrt = go.transform as RectTransform;
                     if (nrt != null)
                     {
-                        float col = n - Main.BaseSlots - 1;
-                        nrt.localPosition = new Vector3(baseX + col * dx, baseY - rowStep, 0f);
+                        int col = n - Main.BaseSlots - 1;
+                        float x = (col >= 0 && col < rowX.Length) ? rowX[col] : rowX[0] + col * fallbackDx;
+                        nrt.localPosition = new Vector3(x + shiftX, baseY - rowStep, 0f);
                     }
 
                     created++;
@@ -539,10 +620,108 @@ namespace DeceiverFusionSlots20
                 }
             }
 
+            // 记录原生基准：同步协程之后每帧都靠它把两排压在"原生 + 平移"的位置上。
+            // （实测游戏会在面板打开后再次改写第一排坐标，只写一次必然被冲掉。）
+            s_RowX = (float[])rowX.Clone();
+            s_RowY = pos1.y;
+            s_HasRow = true;
+
+            float stepX = (Main.BaseSlots > 1) ? (rowX[Main.BaseSlots - 1] - rowX[0]) / (Main.BaseSlots - 1) : 0f;
             Main.Log("UI extended: created " + created
-                     + " slots, pos1=(" + pos1.x.ToString("F1") + "," + pos1.y.ToString("F1") + ")"
-                     + " base=(" + baseX.ToString("F1") + "," + baseY.ToString("F1") + ")"
+                     + " slots, nativeRow=" + (haveRow ? "yes" : "fallback")
+                     + " pos1=(" + pos1.x.ToString("F1") + "," + pos1.y.ToString("F1") + ")"
+                     + " step=" + stepX.ToString("F1") + "/" + rowStep.ToString("F1")
                      + " cell=" + rt1.rect.width.ToString("F1") + "x" + rt1.rect.height.ToString("F1"));
+        }
+
+        /// <summary>
+        /// 把第二排重新贴到第一排对应格子的正下方。
+        ///
+        /// 为什么需要反复调用：面板打开后的若干帧里，游戏自身还会再调一次第一排的位置
+        /// （实测列距会被改小），"设一次就不管"必然错位。这里直接跟随第一排的实际
+        /// localPosition，无论它怎么变，两排都严丝合缝。
+        /// </summary>
+        public static void SyncSecondRow(SpellbookMagicHackMixerView view)
+        {
+            if (view == null) return;
+
+            FieldInfo f = Main.FindField(typeof(SpellbookMagicHackMixerView), "m_Slots");
+            if (f == null) return;
+            var group = f.GetValue(view) as OwlcatToggleGroup;
+            if (group == null) return;
+
+            Transform parent = group.transform;
+            var rt1 = parent.Find("Slot_1") as RectTransform;
+            if (rt1 == null)
+            {
+                OwlcatToggle t = FindToggleByName(group, "Slot_1");
+                if (t == null) return;
+                parent = t.transform.parent;
+                rt1 = t.transform as RectTransform;
+            }
+            if (rt1 == null || parent == null) return;
+
+            float rowStep = (rt1.rect.height > 10f) ? rt1.rect.height + 10f : 58f;
+
+            bool pinned = s_HasRow && s_RowX != null && s_RowX.Length == Main.BaseSlots;
+
+            for (int i = 0; i < Main.BaseSlots; i++)
+            {
+                var a = parent.Find("Slot_" + (i + 1)) as RectTransform;
+                var b = parent.Find("Slot_" + (i + 1 + Main.BaseSlots)) as RectTransform;
+                if (a == null && b == null) continue;
+
+                float x, y;
+
+                if (pinned)
+                {
+                    // 目标位置 = 原生基准 + 整体平移。两排都持续压在这里，
+                    // 游戏若在别处改写第一排坐标，下一帧就会被纠回来。
+                    x = s_RowX[i] + ShiftX;
+                    y = s_RowY + ShiftY;
+                }
+                else
+                {
+                    // 没有基准（面板结构异常）时退回"跟随第一排"
+                    if (a == null) continue;
+                    Vector3 p = a.localPosition;
+                    x = p.x;
+                    y = p.y;
+                }
+
+                if (a != null) SetLocalPos(a, x, y);
+                if (b != null) SetLocalPos(b, x, y - rowStep);
+            }
+        }
+
+        /// <summary>位置没变化就不写，避免每帧把 Canvas 标脏。</summary>
+        private static void SetLocalPos(RectTransform rt, float x, float y)
+        {
+            Vector3 cur = rt.localPosition;
+            if (Mathf.Abs(cur.x - x) < 0.01f && Mathf.Abs(cur.y - y) < 0.01f) return;
+            rt.localPosition = new Vector3(x, y, 0f);
+        }
+
+        /// <summary>
+        /// 读取第一排 10 个槽位的真实 x 坐标。
+        /// 布局还没生效时 10 个按钮返回同一个坐标，这时必须判定为失败（否则整块会塌成一个点）。
+        /// </summary>
+        private static bool TryReadRowX(Transform parent, float[] dst)
+        {
+            for (int i = 0; i < dst.Length; i++)
+            {
+                Transform t = parent.Find("Slot_" + (i + 1));
+                var rt = t as RectTransform;
+                if (rt == null) return false;
+                dst[i] = rt.localPosition.x;
+            }
+
+            for (int i = 1; i < dst.Length; i++)
+            {
+                if (dst[i] - dst[i - 1] < 1f) return false;   // 未按列排开
+            }
+
+            return (dst[dst.Length - 1] - dst[0]) >= 50f;      // 总跨度太小说明没布局
         }
 
         private static void DisableLayout<T>(GameObject go) where T : Behaviour
@@ -629,6 +808,42 @@ namespace DeceiverFusionSlots20
             Instance = go.AddComponent<UIHost>();
         }
 
+        /// <summary>
+        /// 后台把第 11~20 槽位的蓝图建好。蓝图要等游戏资源加载完才能拿到，
+        /// 所以这里用协程轮询，构建好就退出。整个过程与 UI 无关，绝不阻塞读档。
+        /// </summary>
+        public void BeginWarmup()
+        {
+            try
+            {
+                StartCoroutine(WarmupBlueprints());
+            }
+            catch (Exception e)
+            {
+                Main.Log("Warmup coroutine start failed: " + e.Message);
+            }
+        }
+
+        private IEnumerator WarmupBlueprints()
+        {
+            while (!ExtraBlueprints.IsBuilt)
+            {
+                try
+                {
+                    ExtraBlueprints.Ensure();
+                }
+                catch (Exception e)
+                {
+                    Main.Log("Warmup Ensure failed: " + e.Message);
+                }
+
+                if (ExtraBlueprints.IsBuilt) break;
+                yield return new WaitForSecondsRealtime(1f);
+            }
+
+            Main.Log("Blueprint warmup finished");
+        }
+
         public void Schedule(SpellbookMagicHackMixerView view)
         {
             if (view == null) return;
@@ -658,14 +873,44 @@ namespace DeceiverFusionSlots20
 
             if (view == null) yield break;
 
-            try
+            // 重试若干次：面板刚打开时布局可能还没算完，Ensure 会自行判断并退回公式法
+            bool extended = false;
+            for (int attempt = 0; attempt < 10; attempt++)
             {
-                SlotsUI.Ensure(view);
+                if (view == null) yield break;
+
+                try
+                {
+                    SlotsUI.Ensure(view);
+                }
+                catch (Exception e)
+                {
+                    Main.Log("Delayed slot UI ensure failed: " + e);
+                }
+
+                if (SlotsUI.IsExtended(view)) { extended = true; break; }
+                yield return new WaitForSecondsRealtime(0.2f);
             }
-            catch (Exception e)
+
+            if (!extended)
             {
-                Main.Log("Delayed slot UI ensure failed: " + e);
+                Main.Log("Slot UI extension did not take effect after retries");
+                yield break;
             }
+
+            // 每帧同步：既跟随第一排，也在游戏改写坐标后立刻纠回来。
+            // SetLocalPos 在位置没变时不写入，所以稳定后不会产生额外开销。
+            while (view != null)
+            {
+                try { SlotsUI.SyncSecondRow(view); } catch { }
+
+                if (!view.gameObject.activeInHierarchy)
+                    yield return new WaitForSecondsRealtime(0.5f);   // 面板隐藏时降频
+                else
+                    yield return null;
+            }
+
+            Main.Log("Slot UI sync loop ended (panel destroyed)");
         }
     }
 
@@ -685,19 +930,10 @@ namespace DeceiverFusionSlots20
         }
     }
 
-    [HarmonyPatch(typeof(SpellbookMagicHackMixerView), "OnSlotChange")]
-    internal static class Patch_OnSlotChange
-    {
-        private static void Prefix(SpellbookMagicHackMixerView __instance, OwlcatToggle toggle)
-        {
-            try
-            {
-                SlotsUI.Ensure(__instance);
-            }
-            catch (Exception e)
-            {
-                Main.Log("OnSlotChange prefix error: " + e);
-            }
-        }
-    }
+    // 注意：这里曾经有 Patch_OnSlotChange，在 OnSlotChange 的 Prefix 里直接重排槽位。
+    // 实测会导致严重问题：读档时游戏会自动选中一个槽位 → 触发 OnSlotChange → 此时
+    // 法术书 UI 仍在初始化，在事件里 Destroy 布局组件并重排，会打断后续绑定，
+    // 表现为"第一次读档法术书消失，第二次读档又正常"。
+    // 现在所有 UI 工作只在 UIHost 的协程里做（等面板可见 + 布局完成后），
+    // 绝不介入游戏的运行时事件。
 }

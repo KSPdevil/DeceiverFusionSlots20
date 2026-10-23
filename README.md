@@ -77,8 +77,16 @@
 .\build.ps1 -Debug
 ```
 
-> 定位相关的两个常量在 `SlotsUI.Ensure()` 里：`offsetX`（横向，一格 ≈ 53）
-> 和 `offsetY`（纵向，一格 ≈ 58，正数向上）。要微调界面位置只改这两个数。
+> 微调界面位置只改 `SlotsUI` 顶部的两个公共常量（当前 `ShiftX = 0`、`ShiftY = 29`）:
+>
+> ```csharp
+> public const float ShiftX = 0f;    // 横向整体平移；一格 ≈ 53，正数向右
+> public const float ShiftY = 29f;   // 纵向整体平移；一格 ≈ 58，正数向上（29 = 下移半格）
+> ```
+>
+> 列间距不写死：打开面板时先强制跑一次原版布局并记下第一排基准坐标，
+> 之后由同步协程**把两排持续钉在「基准 + 平移」的位置上**（游戏自己再改也会被拉回来），
+> 所以改这两个数一定会立即生效。
 
 ---
 
@@ -101,7 +109,11 @@
 |---|---|
 | `TrySelectSlot` | Prefix 接管，钳制范围改为 0~19，并调用 `ResetCurrentInputToSlot()` 真正切换槽位 |
 | `GetDefaultBlueprint` / `GetTouchBlueprint` | index ≥ 10 时返回自建蓝图（首次调用时惰性构建） |
-| `BindViewImplementation` / `OnSlotChange` | 复制 `Slot_1` 生成 11~20，注册进 toggle group，按栅格重排两排 |
+| `BindViewImplementation` | Postfix 只负责**启动一个协程**：等面板可见、布局算完后克隆 `Slot_1` 生成 11~20，注册进 toggle group，并持续同步两排位置 |
+
+> 为什么不用 `OnSlotChange`：读档时游戏会自动恢复上次选中的槽位并触发该事件，
+> 此时 UI 仍在绑定过程中，在事件回调里销毁布局组件 / 重排按钮会打断初始化
+> （表现为第一次读档法术书消失）。所有 UI 改动一律放到独立协程里做。
 
 新蓝图通过游戏官方的 `BlueprintJsonWrapper` + `Json.Serializer` 反序列化路径深拷贝生成，
 再交给 `ResourcesLibrary.BlueprintsCache.AddCachedBlueprint` 注册 —— 与官方 mod 加载蓝图的流程一致。
@@ -119,7 +131,8 @@
 ```
 
 正常启动应能看到 20 条 `Cloned (json) ...`（新蓝图构建成功）和
-`UI extended: created 10 slots, pos1=(...) base=(...)`（界面扩展成功）。
+`UI extended: created 10 slots, nativeRow=yes`（界面扩展成功；若为 `fallback`
+说明布局尚未生效，会退回固定步进，位置可能略有偏差）。
 
 ---
 
@@ -127,8 +140,9 @@
 
 - 槽位编号文本（11~20）通过反射改写 TextMeshPro 文本实现：如果游戏未来调整 UI 结构，
   编号可能回退显示为 1，**但槽位功能不受影响**（选择和抄录仍按 1~20 正确工作）。
-- 界面栅格是按「本地坐标 + 固定步进」排布的（一格 ≈ 53×58）。在极端 UI 缩放下可能需要
-  微调 `offsetX` / `offsetY`，编译脚本里改一行即可。
+- 界面栅格：打开面板时先强制跑一次原版布局，读取第一排 10 个槽位的真实列坐标，
+  第二排逐列复制（只对整块做固定像素的整体平移 `shiftX` / `shiftY`）。
+  只有在布局尚未生效（读到的坐标全等）时才回退到固定步进 53×58。
 - 仅在 2.1.x 验证过；游戏大版本更新后需重新编译（引用的是游戏程序集）。
 
 ---
